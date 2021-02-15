@@ -1,0 +1,31 @@
+#!/bin/bash
+
+LIB_SOURCE=${LIB_SOURCE:?"Need to set LIB_SOURCE non-empty"}
+dest="/Volumes/CIRCUITPY"
+
+libs=(
+  adafruit_74hc595.mpy
+  adafruit_bus_device
+  adafruit_character_lcd
+  adafruit_datetime.mpy
+  adafruit_esp32spi
+  adafruit_mcp230xx
+  adafruit_requests.mpy
+)
+
+echo "Copying code.py"
+cp -rX "$PWD/code.py" "$dest/code.py"
+
+SECRETS_PY_FILE=${SECRETS_PY_FILE:=$PWD/secrets.py}
+echo "Copying secrets.py from $SECRETS_PY_FILE"
+cp -rX "$SECRETS_PY_FILE" "$dest/secrets.py"
+
+echo "Copying libs... "
+for lib in "${libs[@]}"
+do
+  echo "- copying $lib"
+  cp -rX "$LIB_SOURCE/$lib" "$dest/lib/"
+done
+echo "Copying libs... done"
+
+
