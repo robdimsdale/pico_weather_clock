@@ -1,7 +1,7 @@
 #!/bin/bash
 
 LIB_SOURCE=${LIB_SOURCE:?"Need to set LIB_SOURCE non-empty"}
-dest="/Volumes/CIRCUITPY"
+DESTINATION=${DESTINATION:="/Volumes/CIRCUITPY"}
 
 libs=(
   adafruit_74hc595.mpy
@@ -13,18 +13,18 @@ libs=(
   adafruit_requests.mpy
 )
 
-echo "Copying code.py"
-cp -rX "$PWD/code.py" "$dest/code.py"
+echo "Copying code.py to $DESTINATION/code.py"
+cp -rX "$PWD/code.py" "$DESTINATION/code.py"
 
 SECRETS_PY_FILE=${SECRETS_PY_FILE:=$PWD/secrets.py}
-echo "Copying secrets.py from $SECRETS_PY_FILE"
-cp -rX "$SECRETS_PY_FILE" "$dest/secrets.py"
+echo "Copying secrets.py from $SECRETS_PY_FILE to $DESTINATION/secrets.py"
+cp -rX "$SECRETS_PY_FILE" "$DESTINATION/secrets.py"
 
-echo "Copying libs... "
+echo "Copying libs to $DESTINATION/lib/ ... "
 for lib in "${libs[@]}"
 do
   echo "- copying $lib"
-  cp -rX "$LIB_SOURCE/$lib" "$dest/lib/"
+  cp -rX "$LIB_SOURCE/$lib" "$DESTINATION/lib/"
 done
 echo "Copying libs... done"
 
