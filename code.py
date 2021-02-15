@@ -1,40 +1,14 @@
 import board
 import busio
 import time
+import pwmio
 from digitalio import DigitalInOut
 import adafruit_requests as requests
 from adafruit_esp32spi import adafruit_esp32spi
 from adafruit_esp32spi import adafruit_esp32spi_wifimanager
 import adafruit_character_lcd.character_lcd as characterlcd
 from adafruit_datetime import datetime
-
-print("Initializing...")
-
-lcd_rs = DigitalInOut(board.GP16)
-lcd_en = DigitalInOut(board.GP17)
-lcd_d7 = DigitalInOut(board.GP26)
-lcd_d6 = DigitalInOut(board.GP22)
-lcd_d5 = DigitalInOut(board.GP21)
-lcd_d4 = DigitalInOut(board.GP20)
-
-lcd_columns = 20
-lcd_rows = 4
-
-lcd = characterlcd.Character_LCD_Mono(
-    lcd_rs, lcd_en, lcd_d4, lcd_d5, lcd_d6, lcd_d7, lcd_columns, lcd_rows
-)
-
-lcd.message = "Initializing..."
-
-# Get wifi details and more from a secrets.py file
-try:
-    from secrets import secrets
-except ImportError:
-    print("WiFi secrets are kept in secrets.py, please add them there!")
-    raise
-
-WEATHER_URL = secrets["weather_url"]
-TIME_URL = secrets["time_url"]
+import adafruit_veml7700
 
 TIME_UPDATE_INTERVAL_SECS = 5  # this is also the loop interval
 WEATHER_UPDATE_INTERVAL_SECS = 30
@@ -57,6 +31,64 @@ MONTHS = [
     "Nov",
     "Dec",
 ]
+
+MAX_LUX = 50
+MIN_LUX = 1
+
+# x:input value;
+# a,b:input range
+# c,d:output range
+# y:return value
+def mapFromTo(x, a, b, c, d):
+    y = (x - a) / (b - a) * (d - c) + c
+    return y
+
+
+print("Initializing...")
+
+i2c = busio.I2C(board.GP15, board.GP14)
+veml7700 = adafruit_veml7700.VEML7700(i2c)
+
+lcd_r = pwmio.PWMOut(board.GP28, frequency=10000, duty_cycle=1, variable_frequency=True)
+lcd_g = pwmio.PWMOut(board.GP3, frequency=10000, duty_cycle=1, variable_frequency=True)
+lcd_b = pwmio.PWMOut(board.GP5, frequency=10000, duty_cycle=1, variable_frequency=True)
+
+lcd_rs = DigitalInOut(board.GP16)
+lcd_en = DigitalInOut(board.GP17)
+lcd_d7 = DigitalInOut(board.GP26)
+lcd_d6 = DigitalInOut(board.GP22)
+lcd_d5 = DigitalInOut(board.GP21)
+lcd_d4 = DigitalInOut(board.GP20)
+
+lcd_columns = 20
+lcd_rows = 4
+
+lcd = characterlcd.Character_LCD_RGB(
+    lcd_rs,
+    lcd_en,
+    lcd_d4,
+    lcd_d5,
+    lcd_d6,
+    lcd_d7,
+    lcd_columns,
+    lcd_rows,
+    lcd_r,
+    lcd_g,
+    lcd_b,
+)
+
+lcd.color = [100, 0, 0]
+lcd.message = "Initializing..."
+
+# Get wifi details and more from a secrets.py file
+try:
+    from secrets import secrets
+except ImportError:
+    print("WiFi secrets are kept in secrets.py, please add them there!")
+    raise
+
+WEATHER_URL = secrets["weather_url"]
+TIME_URL = secrets["time_url"]
 
 esp32_cs = DigitalInOut(board.GP9)
 esp32_ready = DigitalInOut(board.GP7)
@@ -153,6 +185,14 @@ print("Initializing complete.")
 
 while True:
     now = time.monotonic()
+
+    lux = veml7700.lux
+    print("Lux:", lux)
+    lux = max(min(lux, MAX_LUX), MIN_LUX)
+
+    brightness = int(mapFromTo(lux, MIN_LUX, MAX_LUX, 1, 100))
+    print("brightness: ", brightness)
+    lcd.color = [brightness, brightness, brightness]
 
     if last_weather_time == None or (
         now - last_weather_time > WEATHER_UPDATE_INTERVAL_SECS

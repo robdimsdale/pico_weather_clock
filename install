@@ -11,6 +11,8 @@ libs=(
   adafruit_esp32spi
   adafruit_mcp230xx
   adafruit_requests.mpy
+  adafruit_veml7700.mpy
+  adafruit_register
 )
 
 echo "Copying code.py to $DESTINATION/code.py"
