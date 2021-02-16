@@ -16,6 +16,8 @@ WEATHER_UPDATE_INTERVAL_SECS = 30
 MAX_SUCCESSIVE_WEATHER_ERRORS = 3
 WIFI_RESET_PAUSE_SECS = 2
 
+DEGREE_SYMBOL = "".join(map(chr, bytes([223])))
+
 DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 MONTHS = [
     "Jan",
@@ -173,8 +175,6 @@ def truncate(desc, length):
     return desc[0] + "'" + desc[len(desc) - length + 2 : len(desc)]
 
 
-deg_symbol = "".join(map(chr, bytes([223])))
-
 last_weather_time = None
 last_weather = None
 while last_weather == None:
@@ -216,7 +216,7 @@ while True:
     else:
         weather_desc = last_weather["weather"][0]["main"]
         temperature = last_weather["main"]["temp"]
-        weather_temp_str = "{}{}F".format(int(temperature), deg_symbol)
+        weather_temp_str = "{}{}F".format(int(temperature), DEGREE_SYMBOL)
 
     dt = get_time()
     if dt == None:
