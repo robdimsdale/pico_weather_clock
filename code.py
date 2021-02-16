@@ -10,10 +10,10 @@ import adafruit_character_lcd.character_lcd as characterlcd
 from adafruit_datetime import datetime
 import adafruit_veml7700
 
+REQUEST_TIMEOUT_SECS = 2
 TIME_UPDATE_INTERVAL_SECS = 5  # this is also the loop interval
 WEATHER_UPDATE_INTERVAL_SECS = 30
 MAX_SUCCESSIVE_WEATHER_ERRORS = 3
-
 WIFI_RESET_PAUSE_SECS = 2
 
 DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
@@ -110,7 +110,7 @@ def get_time():
 
     try:
         print("Updating time... ", end="")
-        response = wifi.get(TIME_URL)
+        response = wifi.get(TIME_URL, timeout=REQUEST_TIMEOUT_SECS)
         rj = response.json()
         response.close()
         success_counter = success_counter + 1
@@ -129,7 +129,7 @@ def get_time():
 
         print("OK")
         return datetime(yyyy, mm, dd, h, m, s)
-    except (ValueError, RuntimeError) as e:
+    except (ValueError, RuntimeError, requests.OutOfRetries) as e:
         print("Failed to get time, retrying\n", e)
 
         wifi.reset()
@@ -147,7 +147,7 @@ def get_weather():
 
     try:
         print("Updating weather... ", end="")
-        response = wifi.get(WEATHER_URL)
+        response = wifi.get(WEATHER_URL, timeout=REQUEST_TIMEOUT_SECS)
         wj = response.json()
         response.close()
         success_counter = success_counter + 1
@@ -155,7 +155,7 @@ def get_weather():
 
         print("OK")
         return wj
-    except (ValueError, RuntimeError) as e:
+    except (ValueError, RuntimeError, requests.OutOfRetries) as e:
         print("Failed to get weather, retrying\n", e)
 
         wifi.reset()
