@@ -106,40 +106,50 @@ error_counter = 0
 successive_weather_errors = 0
 
 
-def get_time():
+def make_request(url):
     global success_counter
     global error_counter
 
     try:
-        print("Updating time... ", end="")
-        response = wifi.get(TIME_URL, timeout=REQUEST_TIMEOUT_SECS)
+        # print("making request: ", url)
+
+        response = wifi.get(url, timeout=REQUEST_TIMEOUT_SECS)
         rj = response.json()
         response.close()
+
         success_counter = success_counter + 1
 
-        dt = rj.split("T")
-        d = dt[0].split("-")
-
-        yyyy = int(d[0])
-        mm = int(d[1])
-        dd = int(d[2])
-
-        t = (dt[1].split("."))[0].split(":")
-        h = int(t[0])
-        m = int(t[1])
-        s = int(t[2])
-
-        print("OK")
-        return datetime(yyyy, mm, dd, h, m, s)
+        return rj
     except (ValueError, RuntimeError, requests.OutOfRetries) as e:
-        print("Failed to get time, retrying\n", e)
+        print("Failed to make request\n", e)
 
+        print("Resetting wifi")
         wifi.reset()
         print("Sleeping {}s to allow wifi reset".format(WIFI_RESET_PAUSE_SECS))
         time.sleep(WIFI_RESET_PAUSE_SECS)
 
         error_counter = error_counter + 1
-        return None
+        raise e
+
+
+def get_time():
+    print("Updating time... ", end="")
+    rj = make_request(TIME_URL)
+
+    dt = rj.split("T")
+    d = dt[0].split("-")
+
+    yyyy = int(d[0])
+    mm = int(d[1])
+    dd = int(d[2])
+
+    t = (dt[1].split("."))[0].split(":")
+    h = int(t[0])
+    m = int(t[1])
+    s = int(t[2])
+
+    print("OK")
+    return datetime(yyyy, mm, dd, h, m, s)
 
 
 def get_weather():
@@ -149,24 +159,16 @@ def get_weather():
 
     try:
         print("Updating weather... ", end="")
-        response = wifi.get(WEATHER_URL, timeout=REQUEST_TIMEOUT_SECS)
-        wj = response.json()
-        response.close()
-        success_counter = success_counter + 1
+        rj = make_request(WEATHER_URL)
+
         successive_weather_errors = 0
 
         print("OK")
-        return wj
+        return rj
     except (ValueError, RuntimeError, requests.OutOfRetries) as e:
-        print("Failed to get weather, retrying\n", e)
-
-        wifi.reset()
-        print("Sleeping {}s to allow wifi reset".format(WIFI_RESET_PAUSE_SECS))
-        time.sleep(WIFI_RESET_PAUSE_SECS)
-
+        print("Failed to get weather - incrementing successive_weather_errors")
         successive_weather_errors += 1
-        error_counter = error_counter + 1
-        return None
+        raise e
 
 
 def truncate(desc, length):
@@ -184,14 +186,15 @@ while last_weather == None:
 print("Initializing complete.")
 
 while True:
+    print("----------------")
+
     now = time.monotonic()
 
-    lux = veml7700.lux
-    print("Lux:", lux)
-    lux = max(min(lux, MAX_LUX), MIN_LUX)
+    original_lux = veml7700.lux
+    lux = max(min(original_lux, MAX_LUX), MIN_LUX)
 
     brightness = int(mapFromTo(lux, MIN_LUX, MAX_LUX, 1, 100))
-    print("brightness: ", brightness)
+    print("Lux: ", original_lux, "- brightness: ", brightness)
     lcd.color = [brightness, brightness, brightness]
 
     if last_weather_time == None or (
@@ -200,12 +203,13 @@ while True:
         print(
             "more than {:d}s since last weather.".format(WEATHER_UPDATE_INTERVAL_SECS)
         )
-        maybe_weather = get_weather()
-        if (
-            maybe_weather == None
-            and successive_weather_errors > MAX_SUCCESSIVE_WEATHER_ERRORS
-        ):
-            last_weather = None
+
+        try:
+            maybe_weather = get_weather()
+        except:
+            if successive_weather_errors > MAX_SUCCESSIVE_WEATHER_ERRORS:
+                last_weather = None
+
         if maybe_weather != None:
             last_weather = maybe_weather
             last_weather_time = now
@@ -218,8 +222,9 @@ while True:
         temperature = last_weather["main"]["temp"]
         weather_temp_str = "{}{}F".format(int(temperature), DEGREE_SYMBOL)
 
-    dt = get_time()
-    if dt == None:
+    try:
+        dt = get_time()
+    except:
         lcd.clear()
         lcd.message = "TIME ERROR"
         continue
@@ -238,4 +243,5 @@ while True:
     print("success: ", success_counter, "- errors: ", error_counter)
 
     print("sleeping for {}s".format(TIME_UPDATE_INTERVAL_SECS))
+    print("----------------")
     time.sleep(TIME_UPDATE_INTERVAL_SECS)
