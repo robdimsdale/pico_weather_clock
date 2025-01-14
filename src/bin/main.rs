@@ -3,8 +3,6 @@
 #![allow(async_fn_in_trait)]
 
 use chrono::{DateTime, Datelike, FixedOffset, TimeDelta, TimeZone, Timelike, Utc};
-use core::fmt::{Display, Formatter};
-use core::marker::PhantomData;
 use core::str::from_utf8;
 use core::*;
 use cyw43::JoinOptions;
@@ -23,8 +21,7 @@ use heapless::Vec;
 use rand::RngCore;
 use reqwless::client::HttpClient;
 use reqwless::request::Method;
-use serde::de::{self, SeqAccess, Visitor};
-use serde::{Deserialize, Deserializer};
+use serde::Deserialize;
 use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _, serde_json_core};
 
@@ -204,252 +201,22 @@ pub struct OpenWeather<'a> {
     pub lon: f32,
     pub timezone: &'a str,
     pub timezone_offset: f32,
-    pub current: Current<'a>,
-    pub minutely: MinutelyBuffer,
-    #[serde(borrow)]
-    pub hourly: Vec<Hourly<'a>, 48>,
-    // #[serde(borrow)]
-    // pub daily: [Daily<'a>; 8],
+    pub current: Current,
+    pub hourly: Vec<Hourly, 48>,
 }
-
-#[derive(Debug, defmt::Format)]
-pub struct MinutelyBuffer([Minutely; 60]);
-
-impl<'de> Deserialize<'de> for MinutelyBuffer {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        struct MinutelyBufferVisitor {
-            marker: PhantomData<fn() -> [Minutely; 60]>,
-        }
-
-        impl MinutelyBufferVisitor {
-            fn new() -> Self {
-                MinutelyBufferVisitor {
-                    marker: PhantomData,
-                }
-            }
-        }
-
-        impl<'de> Visitor<'de> for MinutelyBufferVisitor {
-            // The type that our Visitor is going to produce.
-            type Value = MinutelyBuffer;
-
-            // Format a message stating what data this Visitor expects to receive.
-            fn expecting(&self, formatter: &mut Formatter) -> core::fmt::Result {
-                formatter.write_str("a very special map")
-            }
-
-            // Deserialize MyMap from an abstract "map" provided by the
-            // Deserializer. The MapAccess input is a callback provided by
-            // the Deserializer to let us see each entry in the map.
-            fn visit_seq<S>(self, mut seq: S) -> Result<Self::Value, S::Error>
-            where
-                S: SeqAccess<'de>,
-            {
-                let mut buf = MinutelyBuffer(
-                    [Minutely {
-                        dt: 0,
-                        precipitation: 0.0,
-                    }; 60],
-                );
-
-                for i in 0..60 {
-                    buf.0[i] = match (seq.next_element())? {
-                        Some(val) => val,
-                        None => {
-                            return Err(de::Error::custom("ran out of elements to deserialize"));
-                        }
-                    };
-                }
-
-                // TODO: return an error if there were more than 60 input elements?
-
-                // seq.end()?;
-
-                Ok(buf)
-            }
-        }
-
-        deserializer.deserialize_seq(MinutelyBufferVisitor::new())
-    }
-}
-
-impl Default for MinutelyBuffer {
-    fn default() -> Self {
-        MinutelyBuffer(
-            [Minutely {
-                dt: 0,
-                precipitation: 0.0,
-            }; 60],
-        )
-    }
-}
-
 #[derive(Deserialize, Debug, Default, defmt::Format)]
 #[serde(default)]
-pub struct Current<'a> {
-    pub dt: i64,
-    pub sunrise: i64,
-    pub sunset: i64,
-    pub temp: f32,
-    pub feels_like: f32,
-    pub pressure: f32,
-    pub humidity: f32,
-    pub dew_point: f32,
-    pub uvi: f32,
-    pub clouds: i32,
-    pub visibility: i32,
-    pub wind_speed: f32,
-    pub wind_deg: f32,
-    pub wind_gust: f32,
-    pub rain: Rain,
-    pub snow: Snow,
-    #[serde(borrow)]
-    pub weather: [Weather<'a>; 1],
-}
-
-#[derive(Deserialize, Debug, Default, defmt::Format)]
-#[serde(default)]
-pub struct Rain {
-    #[serde(rename = "1h")]
-    pub one_hour: f32,
-}
-
-#[derive(Deserialize, Debug, Default, defmt::Format)]
-#[serde(default)]
-pub struct Snow {
-    #[serde(rename = "1h")]
-    pub one_hour: f32,
-}
-
-#[derive(Deserialize, Debug, Default, defmt::Format)]
-#[serde(default)]
-pub struct Weather<'a> {
-    pub id: i32,
-    pub main: Main,
-    pub description: &'a str,
-    pub icon: &'a str,
-}
-
-#[derive(
-    Default, Clone, Copy, Deserialize, Debug, PartialEq, Eq, PartialOrd, Ord, defmt::Format,
-)]
-pub enum Main {
-    Thunderstorm,
-    Drizzle,
-    Rain,
-    Snow,
-    Mist,
-    Smoke,
-    Haze,
-    Dust,
-    Fog,
-    Sand,
-    Ash,
-    Squall,
-    Tornado,
-    #[default]
-    Clear,
-    Clouds,
-}
-
-impl Display for Main {
-    fn fmt(&self, f: &mut Formatter) -> core::fmt::Result {
-        match self {
-            Main::Thunderstorm => write!(f, "Thunderstorm"),
-            Main::Drizzle => write!(f, "Drizzle"),
-            Main::Rain => write!(f, "Rain"),
-            Main::Snow => write!(f, "Snow"),
-            Main::Mist => write!(f, "Mist"),
-            Main::Smoke => write!(f, "Smoke"),
-            Main::Haze => write!(f, "Haze"),
-            Main::Dust => write!(f, "Dust"),
-            Main::Fog => write!(f, "Fog"),
-            Main::Sand => write!(f, "Sand"),
-            Main::Ash => write!(f, "Ash"),
-            Main::Squall => write!(f, "Squall"),
-            Main::Tornado => write!(f, "Tornado"),
-            Main::Clear => write!(f, "Clear"),
-            Main::Clouds => write!(f, "Clouds"),
-        }
-    }
-}
-
-#[derive(Deserialize, Debug, Default, Copy, Clone, defmt::Format)]
-#[serde(default)]
-pub struct Minutely {
-    pub dt: i64,
-    pub precipitation: f32,
-}
-
-#[derive(Deserialize, Debug, Default, defmt::Format)]
-#[serde(default)]
-pub struct Hourly<'a> {
+pub struct Current {
     pub dt: i64,
     pub temp: f32,
     pub feels_like: f32,
-    pub pressure: f32,
-    pub humidity: f32,
-    pub dew_point: f32,
-    pub uvi: f32,
-    pub clouds: i32,
-    pub visibility: i32,
-    pub wind_speed: f32,
-    pub wind_deg: f32,
-    pub wind_gust: f32,
-    pub pop: f32,
-    pub rain: Rain,
-    pub snow: Snow,
-    #[serde(borrow)]
-    pub weather: [Weather<'a>; 1],
 }
 
 #[derive(Deserialize, Debug, Default, defmt::Format)]
 #[serde(default)]
-pub struct Daily<'a> {
+pub struct Hourly {
     pub dt: i64,
-    pub sunrise: i64,
-    pub sunset: i64,
-    pub moonrise: i64,
-    pub moonset: i64,
-    pub moonphase: f32,
-    pub temp: Temp,
-    pub feels_like: FeelsLike,
-    pub pressure: f32,
-    pub humidity: f32,
-    pub dew_point: f32,
-    pub uvi: f32,
-    pub pop: f32,
-    pub clouds: i32,
-    pub wind_speed: f32,
-    pub wind_deg: f32,
-    pub wind_gust: f32,
-    pub rain: f32,
-    pub snow: f32,
-    #[serde(borrow)]
-    pub weather: [Weather<'a>; 1],
-}
-
-#[derive(Deserialize, Debug, Default, Copy, Clone, defmt::Format)]
-#[serde(default)]
-pub struct Temp {
-    pub morn: f32,
-    pub day: f32,
-    pub eve: f32,
-    pub night: f32,
-    pub min: f32,
-    pub max: f32,
-}
-
-#[derive(Deserialize, Debug, Default, Copy, Clone, defmt::Format)]
-#[serde(default)]
-pub struct FeelsLike {
-    pub morn: f32,
-    pub day: f32,
-    pub eve: f32,
-    pub night: f32,
+    pub temp: f32,
 }
 
 #[derive(Deserialize, Debug, Default, Copy, Clone)]
