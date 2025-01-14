@@ -10,7 +10,7 @@ use cyw43_pio::{PioSpi, DEFAULT_CLOCK_DIVIDER};
 use embassy_executor::Spawner;
 use embassy_net::dns::DnsSocket;
 use embassy_net::tcp::client::{TcpClient, TcpClientState};
-use embassy_net::{Config, StackResources};
+use embassy_net::{Config, Stack, StackResources};
 use embassy_rp::bind_interrupts;
 use embassy_rp::clocks::RoscRng;
 use embassy_rp::gpio::{Level, Output};
@@ -32,6 +32,7 @@ bind_interrupts!(struct Irqs {
 const WIFI_NETWORK: &str = env!("WIFI_NETWORK");
 const WIFI_PASSWORD: &str = env!("WIFI_PASSWORD");
 const WEATHER_URL: &str = env!("WEATHER_URL");
+const WORLD_TIME_BASE_URL: &str = "http://worldtimeapi.org/api/timezone/";
 
 #[embassy_executor::task]
 async fn cyw43_task(
@@ -131,70 +132,91 @@ async fn main(spawner: Spawner) {
     // And now we can use it!
 
     loop {
-        let mut rx_buffer = [0; 32768];
+        let mut open_weather_rx_buffer = [0; 32768];
 
-        let client_state = TcpClientState::<1, 1024, 1024>::new();
-        let tcp_client = TcpClient::new(stack, &client_state);
-        let dns_client = DnsSocket::new(stack);
+        let open_weather = get_open_weather(stack, &mut open_weather_rx_buffer)
+            .await
+            .unwrap();
 
-        let mut http_client = HttpClient::new(&tcp_client, &dns_client);
-        let url = WEATHER_URL;
+        defmt::info!(
+            "lat/lon: {:?}, {:?} - timezone: {:?}",
+            open_weather.lat,
+            open_weather.lon,
+            open_weather.timezone
+        );
 
-        defmt::info!("connecting to {}", &url);
+        let mut world_time_rx_buffer = [0; 32768];
 
-        let mut request = match http_client.request(Method::GET, &url).await {
-            Ok(req) => req,
-            Err(e) => {
-                defmt::error!("Failed to make HTTP request: {:?}", e);
-                return; // handle the error
-            }
-        };
+        let world_time: WorldTime =
+            get_world_time(stack, &mut world_time_rx_buffer, open_weather.timezone)
+                .await
+                .unwrap();
 
-        let response = match request.send(&mut rx_buffer).await {
-            Ok(resp) => resp,
-            Err(_e) => {
-                defmt::error!("Failed to send HTTP request");
-                return; // handle the error;
-            }
-        };
+        let now = time_in_local(open_weather.timezone_offset as i32, world_time.unixtime);
 
-        let body = match from_utf8(response.body().read_to_end().await.unwrap()) {
-            Ok(b) => b,
-            Err(_e) => {
-                defmt::error!("Failed to read response body");
-                return; // handle the error
-            }
-        };
-        defmt::info!("Response body: {:?}", &body);
+        let ((h_time, h_temp), (l_time, l_temp)) = high_low_temp(&open_weather, &now);
 
-        let bytes = body.as_bytes();
-        match serde_json_core::de::from_slice::<OpenWeather>(bytes) {
-            Ok((output, _used)) => {
-                defmt::info!(
-                    "lat/lon: {:?}, {:?} - timezone: {:?}",
-                    output.lat,
-                    output.lon,
-                    output.timezone
-                );
-
-                defmt::info!("current: {:?}", output.current);
-
-                let ((h_time, h_temp), (l_time, l_temp)) = high_low_temp(&output);
-
-                defmt::info!("High: {:?} at {:?}", h_temp, FixedOffsetDateTime(h_time));
-                defmt::info!("Low: {:?} at {:?}", l_temp, FixedOffsetDateTime(l_time));
-            }
-            Err(_e) => {
-                defmt::error!("Failed to parse response body");
-                return; // handle the error
-            }
-        }
+        defmt::info!(
+            "Now: {:?} at {:?}",
+            open_weather.current.temp,
+            FixedOffsetDateTime(now)
+        );
+        defmt::info!("High: {:?} at {:?}", h_temp, FixedOffsetDateTime(h_time));
+        defmt::info!("Low: {:?} at {:?}", l_temp, FixedOffsetDateTime(l_time));
 
         Timer::after(Duration::from_secs(20)).await;
     }
 }
 
-#[derive(Deserialize, Debug, Default)]
+async fn get_open_weather<'s, 'b: 'w, 'e, 'w>(
+    stack: Stack<'s>,
+    rx_buffer: &'b mut [u8; 32768],
+) -> Result<OpenWeather<'w>, &'e str> {
+    let open_weather_body = make_request(WEATHER_URL, stack, rx_buffer).await.unwrap();
+
+    let bytes = open_weather_body.as_bytes();
+
+    match serde_json_core::de::from_slice::<OpenWeather<'w>>(bytes) {
+        Ok((output, _used)) => {
+            let foo = output;
+            Ok(foo)
+        }
+
+        Err(_e) => {
+            defmt::error!("Failed to parse response body");
+            return Err("Failed to parse response body"); // handle the error
+        }
+    }
+}
+
+async fn get_world_time<'s, 'b, 'e>(
+    stack: Stack<'s>,
+    rx_buffer: &'b mut [u8; 32768],
+    timezone: &str,
+) -> Result<WorldTime, &'e str> {
+    let world_time_url_tmp = WORLD_TIME_BASE_URL
+        .bytes()
+        .chain(timezone.bytes())
+        .collect::<Vec<u8, 200>>();
+
+    let world_time_url = from_utf8(world_time_url_tmp.as_slice()).unwrap();
+    let world_time_body = make_request(world_time_url, stack, rx_buffer)
+        .await
+        .unwrap();
+
+    match serde_json_core::de::from_str::<WorldTime>(world_time_body) {
+        Ok((output, _used)) => {
+            let foo = output;
+            Ok(foo)
+        }
+
+        Err(_e) => {
+            defmt::error!("Failed to parse response body");
+            return Err("Failed to parse response body"); // handle the error
+        }
+    }
+}
+#[derive(Deserialize, Debug, Default, defmt::Format, Clone)]
 #[serde(default)]
 pub struct OpenWeather<'a> {
     pub lat: f32,
@@ -204,7 +226,7 @@ pub struct OpenWeather<'a> {
     pub current: Current,
     pub hourly: Vec<Hourly, 48>,
 }
-#[derive(Deserialize, Debug, Default, defmt::Format)]
+#[derive(Deserialize, Debug, Default, defmt::Format, Clone, Copy)]
 #[serde(default)]
 pub struct Current {
     pub dt: i64,
@@ -212,7 +234,7 @@ pub struct Current {
     pub feels_like: f32,
 }
 
-#[derive(Deserialize, Debug, Default, defmt::Format)]
+#[derive(Deserialize, Debug, Default, defmt::Format, Clone, Copy)]
 #[serde(default)]
 pub struct Hourly {
     pub dt: i64,
@@ -239,17 +261,12 @@ impl defmt::Format for FixedOffsetDateTime {
 
 pub fn high_low_temp(
     w: &OpenWeather,
+    now: &DateTime<FixedOffset>,
 ) -> ((DateTime<FixedOffset>, f32), (DateTime<FixedOffset>, f32)) {
     let mut high = &w.hourly[0];
     let mut low = &w.hourly[0];
 
     let tz_offset = FixedOffset::east_opt(w.timezone_offset as i32).unwrap();
-
-    let now = tz_offset.timestamp_opt(w.current.dt, 0).earliest().unwrap();
-
-    let nt = FixedOffsetDateTime(now);
-
-    defmt::info!("Current time: {:?}", nt);
 
     for h in w.hourly.iter() {
         let ts = Utc.timestamp_opt(h.dt, 0).earliest().unwrap();
@@ -282,4 +299,56 @@ fn timestamp_before_now(ts: &DateTime<Utc>, now: &DateTime<Utc>) -> bool {
 
 fn timestamp_after_24_hours(ts: &DateTime<Utc>, now: &DateTime<Utc>) -> bool {
     *ts - *now > TimeDelta::try_hours(24).unwrap()
+}
+
+#[derive(Deserialize, Debug, Default)]
+#[serde(default)]
+pub struct WorldTime {
+    unixtime: i64,
+}
+
+async fn make_request<'a, 'b, 'c>(
+    url: &str,
+    stack: Stack<'a>,
+    rx_buffer: &'b mut [u8; 32768],
+) -> Result<&'b str, &'c str> {
+    let client_state = TcpClientState::<1, 1024, 1024>::new();
+    let tcp_client = TcpClient::new(stack, &client_state);
+    let dns_client = DnsSocket::new(stack);
+
+    let mut http_client = HttpClient::new(&tcp_client, &dns_client);
+
+    defmt::info!("connecting to {}", url);
+
+    let mut request = match http_client.request(Method::GET, url).await {
+        Ok(req) => req,
+        Err(e) => {
+            defmt::error!("Failed to make HTTP request: {:?}", e);
+            return Err("Failed to make HTTP request"); // handle the error
+        }
+    };
+
+    let response = match request.send(rx_buffer).await {
+        Ok(resp) => resp,
+        Err(_e) => {
+            defmt::error!("Failed to send HTTP request");
+            return Err("Failed to send HTTP request"); // handle the error
+        }
+    };
+
+    let body = match from_utf8(response.body().read_to_end().await.unwrap()) {
+        Ok(b) => b,
+        Err(_e) => {
+            defmt::error!("Failed to read response body");
+            return Err("Failed to read response body"); // handle the error
+        }
+    };
+    defmt::info!("Response body: {:?}", &body);
+
+    Ok(body)
+}
+
+fn time_in_local(timezone_offset: i32, unixtime: i64) -> DateTime<FixedOffset> {
+    let tz_offset = FixedOffset::east_opt(timezone_offset).unwrap();
+    tz_offset.timestamp_opt(unixtime, 0).earliest().unwrap()
 }
