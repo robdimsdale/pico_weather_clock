@@ -3,6 +3,7 @@
 #![allow(async_fn_in_trait)]
 
 use chrono::{DateTime, Datelike, FixedOffset, TimeDelta, TimeZone, Timelike, Utc};
+use core::cell::{Cell, RefCell};
 use core::str::from_utf8;
 use core::*;
 use cyw43::JoinOptions;
@@ -16,7 +17,9 @@ use embassy_rp::clocks::RoscRng;
 use embassy_rp::gpio::{Level, Output};
 use embassy_rp::peripherals::{DMA_CH0, PIO0};
 use embassy_rp::pio::{InterruptHandler, Pio};
-use embassy_time::{Duration, Timer};
+use embassy_sync::blocking_mutex;
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_time::{Duration, Ticker, Timer};
 use heapless::Vec;
 use rand::RngCore;
 use reqwless::client::HttpClient;
@@ -33,6 +36,14 @@ const WIFI_NETWORK: &str = env!("WIFI_NETWORK");
 const WIFI_PASSWORD: &str = env!("WIFI_PASSWORD");
 const WEATHER_URL: &str = env!("WEATHER_URL");
 
+struct MyType {
+    unixtime: u32,
+}
+
+// Use blocking Mutex with Cell/RefCell for sharing non-async things
+static MUTEX_BLOCKING: blocking_mutex::Mutex<CriticalSectionRawMutex, RefCell<MyType>> =
+    blocking_mutex::Mutex::new(RefCell::new(MyType { unixtime: 0 }));
+
 #[embassy_executor::task]
 async fn cyw43_task(
     runner: cyw43::Runner<'static, Output<'static>, PioSpi<'static, PIO0, 0, DMA_CH0>>,
@@ -45,9 +56,23 @@ async fn net_task(mut runner: embassy_net::Runner<'static, cyw43::NetDriver<'sta
     runner.run().await
 }
 
+#[embassy_executor::task]
+async fn print_time_task() -> ! {
+    let mut ticker = Ticker::every(Duration::from_secs(1));
+    loop {
+        ticker.next().await;
+        MUTEX_BLOCKING.lock(|x| {
+            let mut x_borrow = x.borrow_mut();
+            x_borrow.unixtime += 1000;
+            defmt::info!("Time: {:?}", x_borrow.unixtime);
+        });
+    }
+}
+
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     defmt::info!("Hello World!");
+    defmt::unwrap!(spawner.spawn(print_time_task()));
 
     let p = embassy_rp::init(Default::default());
     let mut rng = RoscRng;
