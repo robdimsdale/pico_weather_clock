@@ -32,7 +32,6 @@ bind_interrupts!(struct Irqs {
 const WIFI_NETWORK: &str = env!("WIFI_NETWORK");
 const WIFI_PASSWORD: &str = env!("WIFI_PASSWORD");
 const WEATHER_URL: &str = env!("WEATHER_URL");
-const WORLD_TIME_BASE_URL: &str = "http://worldtimeapi.org/api/timezone/";
 
 #[embassy_executor::task]
 async fn cyw43_task(
@@ -145,14 +144,11 @@ async fn main(spawner: Spawner) {
             open_weather.timezone
         );
 
-        let mut world_time_rx_buffer = [0; 32768];
+        let mut epoch_rx_buffer = [0; 32768];
 
-        let world_time: WorldTime =
-            get_world_time(stack, &mut world_time_rx_buffer, open_weather.timezone)
-                .await
-                .unwrap();
+        let epoch: i64 = get_epoch(stack, &mut epoch_rx_buffer).await.unwrap();
 
-        let now = time_in_local(open_weather.timezone_offset as i32, world_time.unixtime);
+        let now = time_in_local(open_weather.timezone_offset as i32, epoch);
 
         let ((h_time, h_temp), (l_time, l_temp)) = high_low_temp(&open_weather, &now);
 
@@ -189,14 +185,13 @@ async fn get_open_weather<'s, 'b: 'w, 'e, 'w>(
     }
 }
 
-async fn get_world_time<'s, 'b, 'e>(
+async fn get_epoch<'s, 'b, 'e>(
     stack: Stack<'s>,
     rx_buffer: &'b mut [u8; 32768],
-    timezone: &str,
-) -> Result<WorldTime, &'e str> {
-    let world_time_url_tmp = WORLD_TIME_BASE_URL
+) -> Result<i64, &'e str> {
+    let world_time_url_tmp = WEATHER_URL
         .bytes()
-        .chain(timezone.bytes())
+        .chain("/epoch".bytes())
         .collect::<Vec<u8, 200>>();
 
     let world_time_url = from_utf8(world_time_url_tmp.as_slice()).unwrap();
@@ -204,7 +199,7 @@ async fn get_world_time<'s, 'b, 'e>(
         .await
         .unwrap();
 
-    match serde_json_core::de::from_str::<WorldTime>(world_time_body) {
+    match serde_json_core::de::from_str::<i64>(world_time_body) {
         Ok((output, _used)) => {
             let foo = output;
             Ok(foo)
@@ -299,12 +294,6 @@ fn timestamp_before_now(ts: &DateTime<Utc>, now: &DateTime<Utc>) -> bool {
 
 fn timestamp_after_24_hours(ts: &DateTime<Utc>, now: &DateTime<Utc>) -> bool {
     *ts - *now > TimeDelta::try_hours(24).unwrap()
-}
-
-#[derive(Deserialize, Debug, Default)]
-#[serde(default)]
-pub struct WorldTime {
-    unixtime: i64,
 }
 
 async fn make_request<'a, 'b, 'c>(
