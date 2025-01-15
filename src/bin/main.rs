@@ -3,7 +3,7 @@
 #![allow(async_fn_in_trait)]
 
 use chrono::{DateTime, Datelike, FixedOffset, TimeDelta, TimeZone, Timelike, Utc};
-use core::cell::{Cell, RefCell};
+use core::cell::RefCell;
 use core::str::from_utf8;
 use core::*;
 use cyw43::JoinOptions;
@@ -169,9 +169,7 @@ async fn main(spawner: Spawner) {
             open_weather.timezone
         );
 
-        let mut epoch_rx_buffer = [0; 32768];
-
-        let epoch: i64 = get_epoch(stack, &mut epoch_rx_buffer).await.unwrap();
+        let epoch: i64 = get_epoch(stack).await.unwrap();
 
         let now = time_in_local(open_weather.timezone_offset as i32, epoch);
 
@@ -210,17 +208,16 @@ async fn get_open_weather<'s, 'b: 'w, 'e, 'w>(
     }
 }
 
-async fn get_epoch<'s, 'b, 'e>(
-    stack: Stack<'s>,
-    rx_buffer: &'b mut [u8; 32768],
-) -> Result<i64, &'e str> {
+async fn get_epoch<'s, 'b, 'e>(stack: Stack<'s>) -> Result<i64, &'e str> {
+    let mut rx_buffer = [0; 32768]; // TODO: make a more reasonable size for a single i64
+
     let world_time_url_tmp = WEATHER_URL
         .bytes()
         .chain("/epoch".bytes())
         .collect::<Vec<u8, 200>>();
 
     let world_time_url = from_utf8(world_time_url_tmp.as_slice()).unwrap();
-    let world_time_body = make_request(world_time_url, stack, rx_buffer)
+    let world_time_body = make_request(world_time_url, stack, &mut rx_buffer)
         .await
         .unwrap();
 
