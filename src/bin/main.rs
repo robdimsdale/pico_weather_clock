@@ -12,6 +12,7 @@ use embassy_executor::Spawner;
 use embassy_net::dns::DnsSocket;
 use embassy_net::tcp::client::{TcpClient, TcpClientState};
 use embassy_net::{Config, Stack, StackResources};
+use embassy_net::{Ipv4Address, Ipv4Cidr};
 use embassy_rp::bind_interrupts;
 use embassy_rp::clocks::RoscRng;
 use embassy_rp::gpio::{Level, Output};
@@ -20,7 +21,7 @@ use embassy_rp::pio::{InterruptHandler, Pio};
 use embassy_sync::blocking_mutex;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_time::{Duration, Ticker, Timer};
-use heapless::Vec;
+use heapless::{String, Vec};
 use rand::RngCore;
 use reqwless::client::HttpClient;
 use reqwless::request::Method;
@@ -36,13 +37,18 @@ const WIFI_NETWORK: &str = env!("WIFI_NETWORK");
 const WIFI_PASSWORD: &str = env!("WIFI_PASSWORD");
 const WEATHER_URL: &str = env!("WEATHER_URL");
 
-struct MyType {
-    unixtime: u32,
-}
+const PRINT_SECS: u64 = 1;
+const TICK_TIME_SECS: u64 = 1; // TODO: can we update this more often? That would require recording the epoch in millis/nanos vs just seconds
+const WEATHER_EPOCH_UPDATE_SECS: u64 = 10;
+
+type Epoch = u64;
 
 // Use blocking Mutex with Cell/RefCell for sharing non-async things
-static MUTEX_BLOCKING: blocking_mutex::Mutex<CriticalSectionRawMutex, RefCell<MyType>> =
-    blocking_mutex::Mutex::new(RefCell::new(MyType { unixtime: 0 }));
+static TIME_MUTEX: blocking_mutex::Mutex<CriticalSectionRawMutex, RefCell<Epoch>> =
+    blocking_mutex::Mutex::new(RefCell::new(0));
+
+static WEATHER_MUTEX: blocking_mutex::Mutex<CriticalSectionRawMutex, RefCell<Option<OpenWeather>>> =
+    blocking_mutex::Mutex::new(RefCell::new(None));
 
 #[embassy_executor::task]
 async fn cyw43_task(
@@ -57,22 +63,108 @@ async fn net_task(mut runner: embassy_net::Runner<'static, cyw43::NetDriver<'sta
 }
 
 #[embassy_executor::task]
-async fn print_time_task() -> ! {
-    let mut ticker = Ticker::every(Duration::from_secs(1));
+async fn tick_time_task() -> ! {
+    let mut ticker = Ticker::every(Duration::from_secs(TICK_TIME_SECS));
     loop {
-        ticker.next().await;
-        MUTEX_BLOCKING.lock(|x| {
+        TIME_MUTEX.lock(|x| {
             let mut x_borrow = x.borrow_mut();
-            x_borrow.unixtime += 1000;
-            defmt::info!("Time: {:?}", x_borrow.unixtime);
+            *x_borrow += TICK_TIME_SECS;
         });
+
+        ticker.next().await;
+    }
+}
+
+#[embassy_executor::task]
+async fn print_task() -> ! {
+    let mut ticker = Ticker::every(Duration::from_secs(PRINT_SECS));
+    loop {
+        let mut t: u64 = 0;
+        let mut w: OpenWeather = OpenWeather::default();
+        let mut weather_initialized = false;
+
+        TIME_MUTEX.lock(|x| {
+            let x_borrow = x.borrow();
+            t = *x_borrow;
+        });
+
+        WEATHER_MUTEX.lock(|x| {
+            let x_borrow = x.borrow();
+            weather_initialized = match x_borrow.as_ref() {
+                Some(weather) => {
+                    w = (*weather).clone();
+                    true
+                }
+                None => false,
+            }
+        });
+
+        if weather_initialized {
+            let now = time_in_local(w.timezone_offset as i32, t);
+
+            let ((h_time, h_temp), (l_time, l_temp)) = high_low_temp(&w, &now);
+
+            defmt::info!(
+                "Now: {:?} at {:?}",
+                w.current.temp,
+                FixedOffsetDateTime(now)
+            );
+            defmt::info!("High: {:?} at {:?}", h_temp, FixedOffsetDateTime(h_time));
+            defmt::info!("Low: {:?} at {:?}", l_temp, FixedOffsetDateTime(l_time));
+        } else {
+            defmt::info!("No weather data yet - skipping print");
+        }
+
+        ticker.next().await;
+    }
+}
+
+#[embassy_executor::task]
+async fn update_time_from_epoch_task(stack: Stack<'static>) -> ! {
+    let mut ticker = Ticker::every(Duration::from_secs(WEATHER_EPOCH_UPDATE_SECS));
+    loop {
+        let new_epoch = get_epoch(stack).await.unwrap();
+
+        let mut recorded = 0;
+        TIME_MUTEX.lock(|x| {
+            recorded = x.replace(new_epoch);
+        });
+
+        defmt::info!(
+            "Time reset to new epoch. Actual: {:?}, estimated: {:?}, drift: {:?}",
+            new_epoch,
+            recorded,
+            new_epoch - recorded
+        );
+
+        ticker.next().await;
+    }
+}
+
+#[embassy_executor::task]
+async fn update_weather_task(stack: Stack<'static>) -> ! {
+    let mut ticker = Ticker::every(Duration::from_secs(WEATHER_EPOCH_UPDATE_SECS));
+    loop {
+        let open_weather = get_open_weather(stack).await.unwrap();
+
+        defmt::debug!(
+            "lat/lon: {:?}, {:?} - timezone: {:?}",
+            open_weather.lat,
+            open_weather.lon,
+            open_weather.timezone
+        );
+
+        WEATHER_MUTEX.lock(|x| {
+            x.borrow_mut().replace(open_weather);
+        });
+
+        ticker.next().await;
     }
 }
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     defmt::info!("Hello World!");
-    defmt::unwrap!(spawner.spawn(print_time_task()));
 
     let p = embassy_rp::init(Default::default());
     let mut rng = RoscRng;
@@ -110,7 +202,13 @@ async fn main(spawner: Spawner) {
         .set_power_management(cyw43::PowerManagementMode::PowerSave)
         .await;
 
-    let config = Config::dhcpv4(Default::default());
+    // let config = Config::dhcpv4(Default::default());
+    // Use static IP configuration instead of DHCP
+    let config = embassy_net::Config::ipv4_static(embassy_net::StaticConfigV4 {
+        address: Ipv4Cidr::new(Ipv4Address::new(10, 0, 1, 123), 24),
+        dns_servers: Vec::new(),
+        gateway: Some(Ipv4Address::new(10, 0, 1, 1)),
+    });
 
     let seed = rng.next_u64();
 
@@ -139,13 +237,15 @@ async fn main(spawner: Spawner) {
 
     defmt::info!("waiting for DHCP...");
     while !stack.is_config_up() {
-        Timer::after_millis(100).await;
+        Timer::after_secs(5).await;
+        defmt::info!("retrying DHCP...");
     }
     defmt::info!("DHCP is now up!");
 
     defmt::info!("waiting for link up...");
     while !stack.is_link_up() {
         Timer::after_millis(500).await;
+        defmt::info!("retrying link...");
     }
     defmt::info!("Link is up!");
 
@@ -153,62 +253,32 @@ async fn main(spawner: Spawner) {
     stack.wait_config_up().await;
     defmt::info!("Stack is up!");
 
-    // And now we can use it!
+    defmt::unwrap!(spawner.spawn(update_time_from_epoch_task(stack)));
+    defmt::unwrap!(spawner.spawn(update_weather_task(stack)));
+    defmt::unwrap!(spawner.spawn(tick_time_task()));
 
-    loop {
-        let mut open_weather_rx_buffer = [0; 32768];
-
-        let open_weather = get_open_weather(stack, &mut open_weather_rx_buffer)
-            .await
-            .unwrap();
-
-        defmt::info!(
-            "lat/lon: {:?}, {:?} - timezone: {:?}",
-            open_weather.lat,
-            open_weather.lon,
-            open_weather.timezone
-        );
-
-        let epoch: i64 = get_epoch(stack).await.unwrap();
-
-        let now = time_in_local(open_weather.timezone_offset as i32, epoch);
-
-        let ((h_time, h_temp), (l_time, l_temp)) = high_low_temp(&open_weather, &now);
-
-        defmt::info!(
-            "Now: {:?} at {:?}",
-            open_weather.current.temp,
-            FixedOffsetDateTime(now)
-        );
-        defmt::info!("High: {:?} at {:?}", h_temp, FixedOffsetDateTime(h_time));
-        defmt::info!("Low: {:?} at {:?}", l_temp, FixedOffsetDateTime(l_time));
-
-        Timer::after(Duration::from_secs(20)).await;
-    }
+    defmt::unwrap!(spawner.spawn(print_task()));
 }
 
-async fn get_open_weather<'s, 'b: 'w, 'e, 'w>(
-    stack: Stack<'s>,
-    rx_buffer: &'b mut [u8; 32768],
-) -> Result<OpenWeather<'w>, &'e str> {
-    let open_weather_body = make_request(WEATHER_URL, stack, rx_buffer).await.unwrap();
+async fn get_open_weather<'s, 'e>(stack: Stack<'s>) -> Result<OpenWeather, &'e str> {
+    let mut rx_buffer: [u8; 32768] = [0; 32768];
+    let open_weather_body = make_request(WEATHER_URL, stack, &mut rx_buffer)
+        .await
+        .unwrap();
 
     let bytes = open_weather_body.as_bytes();
 
-    match serde_json_core::de::from_slice::<OpenWeather<'w>>(bytes) {
-        Ok((output, _used)) => {
-            let foo = output;
-            Ok(foo)
-        }
+    match serde_json_core::de::from_slice::<OpenWeather>(bytes) {
+        Ok((output, _used)) => Ok(output),
 
         Err(_e) => {
             defmt::error!("Failed to parse response body");
-            return Err("Failed to parse response body"); // handle the error
+            return Err("Failed to parse response body"); // TODO: need to handle the error - print something helpful to screen
         }
     }
 }
 
-async fn get_epoch<'s, 'b, 'e>(stack: Stack<'s>) -> Result<i64, &'e str> {
+async fn get_epoch<'s, 'e>(stack: Stack<'s>) -> Result<u64, &'e str> {
     let mut rx_buffer = [0; 32768]; // TODO: make a more reasonable size for a single i64
 
     let world_time_url_tmp = WEATHER_URL
@@ -221,7 +291,7 @@ async fn get_epoch<'s, 'b, 'e>(stack: Stack<'s>) -> Result<i64, &'e str> {
         .await
         .unwrap();
 
-    match serde_json_core::de::from_str::<i64>(world_time_body) {
+    match serde_json_core::de::from_str::<u64>(world_time_body) {
         Ok((output, _used)) => {
             let foo = output;
             Ok(foo)
@@ -229,16 +299,16 @@ async fn get_epoch<'s, 'b, 'e>(stack: Stack<'s>) -> Result<i64, &'e str> {
 
         Err(_e) => {
             defmt::error!("Failed to parse response body");
-            return Err("Failed to parse response body"); // handle the error
+            return Err("Failed to parse response body"); // handle the error - print something helpful to screen
         }
     }
 }
 #[derive(Deserialize, Debug, Default, defmt::Format, Clone)]
 #[serde(default)]
-pub struct OpenWeather<'a> {
+pub struct OpenWeather {
     pub lat: f32,
     pub lon: f32,
-    pub timezone: &'a str,
+    pub timezone: String<200>,
     pub timezone_offset: f32,
     pub current: Current,
     pub hourly: Vec<Hourly, 48>,
@@ -335,7 +405,7 @@ async fn make_request<'a, 'b, 'c>(
         Ok(req) => req,
         Err(e) => {
             defmt::error!("Failed to make HTTP request: {:?}", e);
-            return Err("Failed to make HTTP request"); // handle the error
+            return Err("Failed to make HTTP request");
         }
     };
 
@@ -343,7 +413,7 @@ async fn make_request<'a, 'b, 'c>(
         Ok(resp) => resp,
         Err(_e) => {
             defmt::error!("Failed to send HTTP request");
-            return Err("Failed to send HTTP request"); // handle the error
+            return Err("Failed to send HTTP request");
         }
     };
 
@@ -351,15 +421,18 @@ async fn make_request<'a, 'b, 'c>(
         Ok(b) => b,
         Err(_e) => {
             defmt::error!("Failed to read response body");
-            return Err("Failed to read response body"); // handle the error
+            return Err("Failed to read response body");
         }
     };
-    defmt::info!("Response body: {:?}", &body);
+    defmt::debug!("Response body: {:?}", &body);
 
     Ok(body)
 }
 
-fn time_in_local(timezone_offset: i32, unixtime: i64) -> DateTime<FixedOffset> {
+fn time_in_local(timezone_offset: i32, unixtime: u64) -> DateTime<FixedOffset> {
     let tz_offset = FixedOffset::east_opt(timezone_offset).unwrap();
-    tz_offset.timestamp_opt(unixtime, 0).earliest().unwrap()
+    tz_offset
+        .timestamp_opt(unixtime as i64, 0)
+        .earliest()
+        .unwrap()
 }
