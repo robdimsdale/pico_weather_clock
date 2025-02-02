@@ -39,7 +39,7 @@ const WEATHER_URL: &str = env!("WEATHER_URL");
 
 const PRINT_SECS: u64 = 1;
 const TICK_TIME_SECS: u64 = 1; // TODO: can we update this more often? That would require recording the epoch in millis/nanos vs just seconds
-const WEATHER_EPOCH_UPDATE_SECS: u64 = 10;
+const WEATHER_EPOCH_UPDATE_SECS: u64 = 30;
 
 type Epoch = u64;
 
@@ -120,32 +120,12 @@ async fn print_task() -> ! {
 }
 
 #[embassy_executor::task]
-async fn update_time_from_epoch_task(stack: Stack<'static>) -> ! {
+async fn update_weather_epoch_task(stack: Stack<'static>) -> ! {
     let mut ticker = Ticker::every(Duration::from_secs(WEATHER_EPOCH_UPDATE_SECS));
     loop {
-        let new_epoch = get_epoch(stack).await.unwrap();
+        let open_weather = get_open_weather(stack).await.unwrap(); // TODO: handle the error - print something helpful to screen?
 
-        let mut recorded = 0;
-        TIME_MUTEX.lock(|x| {
-            recorded = x.replace(new_epoch);
-        });
-
-        defmt::info!(
-            "Time reset to new epoch. Actual: {:?}, estimated: {:?}, drift: {:?}",
-            new_epoch,
-            recorded,
-            new_epoch - recorded
-        );
-
-        ticker.next().await;
-    }
-}
-
-#[embassy_executor::task]
-async fn update_weather_task(stack: Stack<'static>) -> ! {
-    let mut ticker = Ticker::every(Duration::from_secs(WEATHER_EPOCH_UPDATE_SECS));
-    loop {
-        let open_weather = get_open_weather(stack).await.unwrap();
+        defmt::info!("Weather updated successfully");
 
         defmt::debug!(
             "lat/lon: {:?}, {:?} - timezone: {:?}",
@@ -157,6 +137,22 @@ async fn update_weather_task(stack: Stack<'static>) -> ! {
         WEATHER_MUTEX.lock(|x| {
             x.borrow_mut().replace(open_weather);
         });
+
+        let epoch = get_epoch(stack).await.unwrap(); // TODO: handle the error - print something helpful to screen?
+
+        let mut recorded_epoch = 0;
+        TIME_MUTEX.lock(|x| {
+            recorded_epoch = x.replace(epoch);
+        });
+
+        defmt::info!("Time updated successfully");
+
+        defmt::debug!(
+            "Time reset to new epoch. Actual: {:?}, estimated: {:?}, drift: {:?}",
+            epoch,
+            recorded_epoch,
+            epoch - recorded_epoch
+        );
 
         ticker.next().await;
     }
@@ -253,8 +249,7 @@ async fn main(spawner: Spawner) {
     stack.wait_config_up().await;
     defmt::info!("Stack is up!");
 
-    defmt::unwrap!(spawner.spawn(update_time_from_epoch_task(stack)));
-    defmt::unwrap!(spawner.spawn(update_weather_task(stack)));
+    defmt::unwrap!(spawner.spawn(update_weather_epoch_task(stack)));
     defmt::unwrap!(spawner.spawn(tick_time_task()));
 
     defmt::unwrap!(spawner.spawn(print_task()));
