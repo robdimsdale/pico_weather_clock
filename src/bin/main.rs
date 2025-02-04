@@ -4,7 +4,7 @@
 
 use chrono::{DateTime, Datelike, FixedOffset, TimeDelta, TimeZone, Timelike, Utc};
 use core::cell::RefCell;
-use core::str::from_utf8;
+use core::str::{from_utf8, FromStr};
 use core::*;
 use cyw43::JoinOptions;
 use cyw43_pio::{PioSpi, DEFAULT_CLOCK_DIVIDER};
@@ -33,25 +33,13 @@ bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => InterruptHandler<PIO0>;
 });
 
+const URL_LENGTH: usize = 200;
 const WIFI_NETWORK: &str = env!("WIFI_NETWORK");
 const WIFI_PASSWORD: &str = env!("WIFI_PASSWORD");
 const WEATHER_URL: &str = env!("WEATHER_URL");
 
 const PRINT_FREQ_MILLIS: u64 = 1000;
 const WEATHER_EPOCH_UPDATE_FREQ_SECS: u64 = 30;
-
-#[derive(Debug, Clone, Copy)]
-struct EpochTime {
-    epoch: u64,
-    updated_instant: Instant,
-}
-
-const fn default_epoch_time() -> EpochTime {
-    EpochTime {
-        epoch: 0,
-        updated_instant: Instant::from_millis(0),
-    }
-}
 
 // Use blocking Mutex with Cell/RefCell for sharing non-async things
 static TIME_MUTEX: blocking_mutex::Mutex<CriticalSectionRawMutex, RefCell<EpochTime>> =
@@ -271,15 +259,10 @@ async fn get_open_weather<'s, 'e>(stack: Stack<'s>) -> Result<OpenWeather, &'e s
 async fn get_epoch<'s, 'e>(stack: Stack<'s>) -> Result<u64, &'e str> {
     let mut rx_buffer = [0; 32768]; // TODO: make a more reasonable size for a single i64
 
-    let world_time_url_tmp = WEATHER_URL
-        .bytes()
-        .chain("/epoch".bytes())
-        .collect::<Vec<u8, 200>>();
+    let mut w: String<URL_LENGTH> = String::from_str(WEATHER_URL).unwrap();
+    w.push_str("/epoch").unwrap();
 
-    let world_time_url = from_utf8(world_time_url_tmp.as_slice()).unwrap();
-    let world_time_body = make_request(world_time_url, stack, &mut rx_buffer)
-        .await
-        .unwrap();
+    let world_time_body = make_request(&w, stack, &mut rx_buffer).await.unwrap();
 
     match serde_json_core::de::from_str::<u64>(world_time_body) {
         Ok((output, _used)) => {
@@ -293,6 +276,48 @@ async fn get_epoch<'s, 'e>(stack: Stack<'s>) -> Result<u64, &'e str> {
         }
     }
 }
+
+async fn make_request<'a, 'b, 'c>(
+    url: &str,
+    stack: Stack<'a>,
+    rx_buffer: &'b mut [u8; 32768],
+) -> Result<&'b str, &'c str> {
+    let client_state = TcpClientState::<1, 1024, 1024>::new();
+    let tcp_client = TcpClient::new(stack, &client_state);
+    let dns_client = DnsSocket::new(stack);
+
+    let mut http_client = HttpClient::new(&tcp_client, &dns_client);
+
+    defmt::info!("connecting to {}", url);
+
+    let mut request = match http_client.request(Method::GET, url).await {
+        Ok(req) => req,
+        Err(e) => {
+            defmt::error!("Failed to make HTTP request: {:?}", e);
+            return Err("Failed to make HTTP request");
+        }
+    };
+
+    let response = match request.send(rx_buffer).await {
+        Ok(resp) => resp,
+        Err(_e) => {
+            defmt::error!("Failed to send HTTP request");
+            return Err("Failed to send HTTP request");
+        }
+    };
+
+    let body = match from_utf8(response.body().read_to_end().await.unwrap()) {
+        Ok(b) => b,
+        Err(_e) => {
+            defmt::error!("Failed to read response body");
+            return Err("Failed to read response body");
+        }
+    };
+    defmt::debug!("Response body: {:?}", &body);
+
+    Ok(body)
+}
+
 #[derive(Deserialize, Debug, Default, defmt::Format, Clone)]
 #[serde(default)]
 pub struct OpenWeather {
@@ -371,6 +396,14 @@ pub fn high_low_temp(
     ((h, high.temp), (l, low.temp))
 }
 
+fn time_in_local(timezone_offset: i32, unixtime: u64) -> DateTime<FixedOffset> {
+    let tz_offset = FixedOffset::east_opt(timezone_offset).unwrap();
+    tz_offset
+        .timestamp_opt(unixtime as i64, 0)
+        .earliest()
+        .unwrap()
+}
+
 fn timestamp_before_now(ts: &DateTime<Utc>, now: &DateTime<Utc>) -> bool {
     *ts - *now < TimeDelta::zero()
 }
@@ -379,51 +412,15 @@ fn timestamp_after_24_hours(ts: &DateTime<Utc>, now: &DateTime<Utc>) -> bool {
     *ts - *now > TimeDelta::try_hours(24).unwrap()
 }
 
-async fn make_request<'a, 'b, 'c>(
-    url: &str,
-    stack: Stack<'a>,
-    rx_buffer: &'b mut [u8; 32768],
-) -> Result<&'b str, &'c str> {
-    let client_state = TcpClientState::<1, 1024, 1024>::new();
-    let tcp_client = TcpClient::new(stack, &client_state);
-    let dns_client = DnsSocket::new(stack);
-
-    let mut http_client = HttpClient::new(&tcp_client, &dns_client);
-
-    defmt::info!("connecting to {}", url);
-
-    let mut request = match http_client.request(Method::GET, url).await {
-        Ok(req) => req,
-        Err(e) => {
-            defmt::error!("Failed to make HTTP request: {:?}", e);
-            return Err("Failed to make HTTP request");
-        }
-    };
-
-    let response = match request.send(rx_buffer).await {
-        Ok(resp) => resp,
-        Err(_e) => {
-            defmt::error!("Failed to send HTTP request");
-            return Err("Failed to send HTTP request");
-        }
-    };
-
-    let body = match from_utf8(response.body().read_to_end().await.unwrap()) {
-        Ok(b) => b,
-        Err(_e) => {
-            defmt::error!("Failed to read response body");
-            return Err("Failed to read response body");
-        }
-    };
-    defmt::debug!("Response body: {:?}", &body);
-
-    Ok(body)
+#[derive(Debug, Clone, Copy)]
+struct EpochTime {
+    epoch: u64,
+    updated_instant: Instant,
 }
 
-fn time_in_local(timezone_offset: i32, unixtime: u64) -> DateTime<FixedOffset> {
-    let tz_offset = FixedOffset::east_opt(timezone_offset).unwrap();
-    tz_offset
-        .timestamp_opt(unixtime as i64, 0)
-        .earliest()
-        .unwrap()
+const fn default_epoch_time() -> EpochTime {
+    EpochTime {
+        epoch: 0,
+        updated_instant: Instant::from_millis(0),
+    }
 }
