@@ -234,15 +234,12 @@ async fn main(spawner: Spawner) {
     defmt::info!("Stack is up!");
 
     defmt::unwrap!(spawner.spawn(update_weather_epoch_task(stack)));
-
     defmt::unwrap!(spawner.spawn(print_task()));
 }
 
 async fn get_open_weather<'s, 'e>(stack: Stack<'s>) -> Result<OpenWeather, &'e str> {
     let mut rx_buffer: [u8; 32768] = [0; 32768];
-    let open_weather_body = make_request(WEATHER_URL, stack, &mut rx_buffer)
-        .await
-        .unwrap();
+    let open_weather_body = make_request(WEATHER_URL, stack, &mut rx_buffer).await?;
 
     let bytes = open_weather_body.as_bytes();
 
@@ -262,7 +259,7 @@ async fn get_epoch<'s, 'e>(stack: Stack<'s>) -> Result<u64, &'e str> {
     let mut w: String<URL_LENGTH> = String::from_str(WEATHER_URL).unwrap();
     w.push_str("/epoch").unwrap();
 
-    let world_time_body = make_request(&w, stack, &mut rx_buffer).await.unwrap();
+    let world_time_body = make_request(&w, stack, &mut rx_buffer).await?;
 
     match serde_json_core::de::from_str::<u64>(world_time_body) {
         Ok((output, _used)) => {
@@ -306,7 +303,7 @@ async fn make_request<'a, 'b, 'c>(
         }
     };
 
-    let body = match from_utf8(response.body().read_to_end().await.unwrap()) {
+    let body = match from_utf8(response.body().read_to_end().await?) {
         Ok(b) => b,
         Err(_e) => {
             defmt::error!("Failed to read response body");
