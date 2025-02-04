@@ -20,7 +20,7 @@ use embassy_rp::peripherals::{DMA_CH0, PIO0};
 use embassy_rp::pio::{InterruptHandler, Pio};
 use embassy_sync::blocking_mutex;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_time::{Duration, Ticker, Timer};
+use embassy_time::{Duration, Instant, Ticker, Timer};
 use heapless::{String, Vec};
 use rand::RngCore;
 use reqwless::client::HttpClient;
@@ -37,15 +37,25 @@ const WIFI_NETWORK: &str = env!("WIFI_NETWORK");
 const WIFI_PASSWORD: &str = env!("WIFI_PASSWORD");
 const WEATHER_URL: &str = env!("WEATHER_URL");
 
-const PRINT_SECS: u64 = 1;
-const TICK_TIME_SECS: u64 = 1; // TODO: can we update this more often? That would require recording the epoch in millis/nanos vs just seconds
-const WEATHER_EPOCH_UPDATE_SECS: u64 = 30;
+const PRINT_FREQ_MILLIS: u64 = 1000;
+const WEATHER_EPOCH_UPDATE_FREQ_SECS: u64 = 30;
 
-type Epoch = u64;
+#[derive(Debug, Clone, Copy)]
+struct EpochTime {
+    epoch: u64,
+    updated_instant: Instant,
+}
+
+const fn default_epoch_time() -> EpochTime {
+    EpochTime {
+        epoch: 0,
+        updated_instant: Instant::from_millis(0),
+    }
+}
 
 // Use blocking Mutex with Cell/RefCell for sharing non-async things
-static TIME_MUTEX: blocking_mutex::Mutex<CriticalSectionRawMutex, RefCell<Epoch>> =
-    blocking_mutex::Mutex::new(RefCell::new(0));
+static TIME_MUTEX: blocking_mutex::Mutex<CriticalSectionRawMutex, RefCell<EpochTime>> =
+    blocking_mutex::Mutex::new(RefCell::new(default_epoch_time()));
 
 static WEATHER_MUTEX: blocking_mutex::Mutex<CriticalSectionRawMutex, RefCell<Option<OpenWeather>>> =
     blocking_mutex::Mutex::new(RefCell::new(None));
@@ -63,23 +73,10 @@ async fn net_task(mut runner: embassy_net::Runner<'static, cyw43::NetDriver<'sta
 }
 
 #[embassy_executor::task]
-async fn tick_time_task() -> ! {
-    let mut ticker = Ticker::every(Duration::from_secs(TICK_TIME_SECS));
-    loop {
-        TIME_MUTEX.lock(|x| {
-            let mut x_borrow = x.borrow_mut();
-            *x_borrow += TICK_TIME_SECS;
-        });
-
-        ticker.next().await;
-    }
-}
-
-#[embassy_executor::task]
 async fn print_task() -> ! {
-    let mut ticker = Ticker::every(Duration::from_secs(PRINT_SECS));
+    let mut ticker = Ticker::every(Duration::from_millis(PRINT_FREQ_MILLIS));
     loop {
-        let mut t: u64 = 0;
+        let mut t: EpochTime = default_epoch_time();
         let mut w: OpenWeather = OpenWeather::default();
         let mut weather_initialized = false;
 
@@ -99,18 +96,22 @@ async fn print_task() -> ! {
             }
         });
 
+        let unixtime = t.epoch + t.updated_instant.elapsed().as_secs();
+
         if weather_initialized {
-            let now = time_in_local(w.timezone_offset as i32, t);
+            let now = time_in_local(w.timezone_offset as i32, unixtime);
 
             let ((h_time, h_temp), (l_time, l_temp)) = high_low_temp(&w, &now);
 
             defmt::info!(
-                "Now: {:?} at {:?}",
+                "Now: {:?} at {:?}. High: {:?} at {:?}. Low: {:?} at {:?}",
                 w.current.temp,
-                FixedOffsetDateTime(now)
+                FixedOffsetDateTime(now),
+                h_temp,
+                FixedOffsetDateTime(h_time),
+                l_temp,
+                FixedOffsetDateTime(l_time)
             );
-            defmt::info!("High: {:?} at {:?}", h_temp, FixedOffsetDateTime(h_time));
-            defmt::info!("Low: {:?} at {:?}", l_temp, FixedOffsetDateTime(l_time));
         } else {
             defmt::info!("No weather data yet - skipping print");
         }
@@ -121,7 +122,7 @@ async fn print_task() -> ! {
 
 #[embassy_executor::task]
 async fn update_weather_epoch_task(stack: Stack<'static>) -> ! {
-    let mut ticker = Ticker::every(Duration::from_secs(WEATHER_EPOCH_UPDATE_SECS));
+    let mut ticker = Ticker::every(Duration::from_secs(WEATHER_EPOCH_UPDATE_FREQ_SECS));
     loop {
         let open_weather = get_open_weather(stack).await.unwrap(); // TODO: handle the error - print something helpful to screen?
 
@@ -135,24 +136,19 @@ async fn update_weather_epoch_task(stack: Stack<'static>) -> ! {
         );
 
         WEATHER_MUTEX.lock(|x| {
-            x.borrow_mut().replace(open_weather);
+            x.replace(Some(open_weather));
         });
 
         let epoch = get_epoch(stack).await.unwrap(); // TODO: handle the error - print something helpful to screen?
 
-        let mut recorded_epoch = 0;
         TIME_MUTEX.lock(|x| {
-            recorded_epoch = x.replace(epoch);
+            x.replace(EpochTime {
+                epoch: epoch,
+                updated_instant: Instant::now(),
+            });
         });
 
         defmt::info!("Time updated successfully");
-
-        defmt::debug!(
-            "Time reset to new epoch. Actual: {:?}, estimated: {:?}, drift: {:?}",
-            epoch,
-            recorded_epoch,
-            epoch - recorded_epoch
-        );
 
         ticker.next().await;
     }
@@ -250,7 +246,6 @@ async fn main(spawner: Spawner) {
     defmt::info!("Stack is up!");
 
     defmt::unwrap!(spawner.spawn(update_weather_epoch_task(stack)));
-    defmt::unwrap!(spawner.spawn(tick_time_task()));
 
     defmt::unwrap!(spawner.spawn(print_task()));
 }
@@ -331,12 +326,13 @@ impl defmt::Format for FixedOffsetDateTime {
     fn format(&self, f: defmt::Formatter) {
         defmt::write!(
             f,
-            "{:04}/{:02}/{:02} {:02}:{:02}",
+            "{:04}/{:02}/{:02} {:02}:{:02}:{:02}",
             self.0.year(),
             self.0.month(),
             self.0.day(),
             self.0.hour(),
-            self.0.minute()
+            self.0.minute(),
+            self.0.second()
         );
     }
 }
